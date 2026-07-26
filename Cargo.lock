@@ -2997,6 +2997,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lapce-acp"
+version = "0.4.6"
+dependencies = [
+ "anyhow",
+ "crossbeam-channel",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tracing 0.2.0",
+]
+
+[[package]]
 name = "lapce-app"
 version = "0.4.6"
 dependencies = [
