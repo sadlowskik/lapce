@@ -183,6 +183,7 @@ pub struct WindowTabData {
     pub global_search: GlobalSearchData,
     pub call_hierarchy_data: CallHierarchyData,
     pub about_data: AboutData,
+    pub agent: crate::agent::AgentData,
     pub alert_data: AlertBoxData,
     pub layout_rect: RwSignal<Rect>,
     pub title_height: RwSignal<f64>,
@@ -541,6 +542,7 @@ impl WindowTabData {
         }
 
         let about_data = AboutData::new(cx, common.focus);
+        let agent = crate::agent::AgentData::new(cx, main_split.clone(), common.clone());
         let alert_data = AlertBoxData::new(cx, common.clone());
 
         let window_tab_data = Self {
@@ -564,6 +566,7 @@ impl WindowTabData {
                 scroll_to_line: cx.create_rw_signal(None),
             },
             about_data,
+            agent,
             alert_data,
             layout_rect: cx.create_rw_signal(Rect::ZERO),
             title_height,
@@ -1343,6 +1346,29 @@ impl WindowTabData {
             // ==== UI ====
             ShowAbout => {
                 self.about_data.open();
+            }
+            ConnectAgent => {
+                // Configured by environment rather than a settings schema for
+                // now: any ACP agent is `program args...`, and hard-coding one
+                // vendor's command would defeat the point of a protocol.
+                let program = std::env::var("LAPCE_AGENT_PROGRAM")
+                    .unwrap_or_else(|_| "claude-code-acp".to_string());
+                let args: Vec<String> = std::env::var("LAPCE_AGENT_ARGS")
+                    .map(|a| a.split_whitespace().map(|s| s.to_string()).collect())
+                    .unwrap_or_default();
+                let cwd = self
+                    .workspace
+                    .path
+                    .clone()
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                self.panel.show_panel(&PanelKind::Agent);
+                self.agent.start(program, args, cwd);
+            }
+            DisconnectAgent => {
+                self.agent.stop();
+            }
+            CancelAgentTurn => {
+                self.agent.cancel();
             }
 
             // ==== Updating ====
@@ -2630,7 +2656,8 @@ impl WindowTabData {
             | PanelKind::CallHierarchy
             | PanelKind::DocumentSymbol
             | PanelKind::References
-            | PanelKind::Implementation => {
+            | PanelKind::Implementation
+            | PanelKind::Agent => {
                 // Some panels don't accept focus (yet). Fall back to visibility check
                 // in those cases.
                 self.panel.is_panel_visible(&kind)

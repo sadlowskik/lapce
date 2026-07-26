@@ -3033,6 +3033,7 @@ dependencies = [
  "indexmap",
  "interprocess",
  "itertools 0.12.1",
+ "lapce-acp",
  "lapce-core",
  "lapce-proxy",
  "lapce-rpc",

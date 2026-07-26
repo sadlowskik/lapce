@@ -551,6 +551,18 @@ pub enum LapceWorkbenchCommand {
     #[strum(message = "About Lapce")]
     ShowAbout,
 
+    #[strum(serialize = "connect_agent")]
+    #[strum(message = "Agent: Connect")]
+    ConnectAgent,
+
+    #[strum(serialize = "disconnect_agent")]
+    #[strum(message = "Agent: Disconnect")]
+    DisconnectAgent,
+
+    #[strum(serialize = "cancel_agent_turn")]
+    #[strum(message = "Agent: Cancel Turn")]
+    CancelAgentTurn,
+
     #[strum(message = "Save All Files")]
     #[strum(serialize = "save_all")]
     SaveAll,

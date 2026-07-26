@@ -72,6 +72,7 @@ psp-types = { git = "https://github.com/lapce/psp-types", rev = "f7fea28f59e7b2d
 
 lapce-xi-rope = { version = "0.3.2", features = ["serde"] }
 
+lapce-acp   = { path = "./lapce-acp" }
 lapce-core  = { path = "./lapce-core" }
 lapce-rpc   = { path = "./lapce-rpc" }
 lapce-proxy = { path = "./lapce-proxy" }
