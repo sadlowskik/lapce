@@ -18,7 +18,7 @@ use floem::{
     View,
     event::{Event, EventListener},
     keyboard::{Key, NamedKey},
-    reactive::SignalGet,
+    reactive::{SignalGet, SignalUpdate},
     style::CursorStyle,
     views::{Decorators, container, dyn_stack, label, scroll, stack},
 };
@@ -66,6 +66,7 @@ pub fn agent_panel(
                 .border_color(config.color(LapceColor::LAPCE_BORDER))
         }),
         transcript(window_tab_data.clone()).style(|s| s.size_pct(100.0, 100.0)),
+        permission_bar(window_tab_data.clone()),
         prompt_box(window_tab_data.clone()),
     ))
     .style(|s| s.flex_col().size_pct(100.0, 100.0))
@@ -244,4 +245,80 @@ fn prompt_box(window_tab_data: Rc<WindowTabData>) -> impl View {
             .border_top(1.0)
             .border_color(config.color(LapceColor::LAPCE_BORDER))
     })
+}
+
+/// Shown only while the agent is blocked on a decision.
+///
+/// The agent is waiting for this, so every way out sends an answer: each option
+/// sends its id, and Dismiss sends `None`, which the client reports as
+/// cancelled. Leaving without answering would hang the turn -- the exact bug
+/// the client was fixed for.
+fn permission_bar(window_tab_data: Rc<WindowTabData>) -> impl View {
+    let config = window_tab_data.common.config;
+    let agent = window_tab_data.agent.clone();
+    let pending = agent.pending_permission;
+
+    dyn_stack(
+        // Zero or one row: a stack keyed on the title so the bar rebuilds when
+        // a different request arrives.
+        move || pending.get().into_iter().collect::<Vec<_>>(),
+        |p| p.title.clone(),
+        move |request| {
+            let title = request.title.clone();
+            let options = request.options.clone();
+            let dismiss = request.clone();
+            let dismiss_signal = pending;
+
+            stack((
+                label(move || format!("Allow: {title}?")).style(move |s| {
+                    s.padding_horiz(10.0)
+                        .padding_vert(6.0)
+                        .width_pct(100.0)
+                        .color(config.get().color(LapceColor::EDITOR_FOREGROUND))
+                }),
+                dyn_stack(
+                    move || options.clone().into_iter().enumerate(),
+                    |(i, _)| *i,
+                    move |(_, (option_id, name))| {
+                        let answer = request.clone();
+                        let signal = pending;
+                        label(move || format!("  [ {name} ]  "))
+                            .style(move |s| {
+                                s.padding_vert(4.0)
+                                    .cursor(CursorStyle::Pointer)
+                                    .color(
+                                        config.get().color(LapceColor::EDITOR_LINK),
+                                    )
+                            })
+                            .on_click_stop(move |_| {
+                                answer.respond(Some(option_id.clone()));
+                                signal.set(None);
+                            })
+                    },
+                )
+                .style(|s| s.padding_horiz(10.0).padding_bottom(6.0)),
+                label(|| "  [ Dismiss ]  ".to_string())
+                    .style(move |s| {
+                        s.padding_horiz(10.0)
+                            .padding_bottom(6.0)
+                            .cursor(CursorStyle::Pointer)
+                            .color(config.get().color(LapceColor::EDITOR_DIM))
+                    })
+                    .on_click_stop(move |_| {
+                        // Dismissing is still an answer. Silence hangs the turn.
+                        dismiss.respond(None);
+                        dismiss_signal.set(None);
+                    }),
+            ))
+            .style(move |s| {
+                let config = config.get();
+                s.flex_col()
+                    .width_pct(100.0)
+                    .border_top(1.0)
+                    .border_color(config.color(LapceColor::LAPCE_WARN))
+                    .background(config.color(LapceColor::PANEL_CURRENT_BACKGROUND))
+            })
+        },
+    )
+    .style(|s| s.flex_col().width_pct(100.0))
 }

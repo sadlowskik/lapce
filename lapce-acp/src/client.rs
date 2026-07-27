@@ -48,6 +48,13 @@ pub enum AgentEvent {
     Exited(Option<i32>),
 }
 
+/// Decides a permission request, returning the chosen `optionId`.
+///
+/// `None` means no choice was made and the request is answered `cancelled`.
+/// It is called on its own thread and may block for as long as a human takes.
+pub type PermissionHandler =
+    Arc<dyn Fn(RequestPermissionParams) -> Option<String> + Send + Sync>;
+
 /// A running agent subprocess.
 pub struct AcpClient {
     child: Mutex<Child>,
@@ -57,8 +64,11 @@ pub struct AcpClient {
     pub events: Receiver<AgentEvent>,
     /// Agent identity from `initialize`, once the handshake has run.
     pub agent_info: Mutex<Option<Implementation>>,
-    /// What to do when the agent asks permission. Refuses by default.
+    /// Used when no handler is installed. Refuses by default.
     pub permission_policy: Arc<Mutex<PermissionPolicy>>,
+    /// Installed by the editor to ask a human. Falls back to the policy when
+    /// absent, so a headless caller still works.
+    handler: Arc<Mutex<Option<PermissionHandler>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +118,7 @@ impl AcpClient {
         // from outside that is indistinguishable from a slow model.
         let stdin = Arc::new(Mutex::new(stdin));
         let policy = Arc::new(Mutex::new(PermissionPolicy::default()));
+        let handler: Arc<Mutex<Option<PermissionHandler>>> = Arc::new(Mutex::new(None));
 
         let (tx, events) = unbounded();
         let pending: Arc<Mutex<HashMap<u64, Sender<Result<Value, RpcErr>>>>> =
@@ -120,6 +131,7 @@ impl AcpClient {
             let tx = tx.clone();
             let stdin = stdin.clone();
             let policy = policy.clone();
+            let handler = handler.clone();
             thread::spawn(move || {
                 let mut reader = BufReader::new(stdout);
                 let mut line = String::new();
@@ -147,22 +159,35 @@ impl AcpClient {
                     if let Some(method) = msg.get("method").and_then(|m| m.as_str())
                     {
                         if let Some(id) = msg.get("id").cloned() {
-                            let body = answer_request(
-                                method,
-                                msg.get("params"),
-                                *policy.lock(),
-                                &tx,
-                            );
-                            let mut reply = serde_json::Map::new();
-                            reply.insert("jsonrpc".into(), json!("2.0"));
-                            reply.insert("id".into(), id);
-                            for (k, v) in body {
-                                reply.insert(k, v);
-                            }
-                            let line = format!("{}\n", Value::Object(reply));
-                            let mut out = stdin.lock();
-                            let _ = out.write_all(line.as_bytes());
-                            let _ = out.flush();
+                            // Answered on a separate thread: a handler may wait
+                            // on a human, and blocking here would stop the read
+                            // loop -- so nothing else the agent says would
+                            // arrive while the dialog is open.
+                            let params = msg.get("params").cloned();
+                            let policy = *policy.lock();
+                            let installed = handler.lock().clone();
+                            let stdin = stdin.clone();
+                            let tx = tx.clone();
+                            let method = method.to_string();
+                            thread::spawn(move || {
+                                let body = answer_request(
+                                    &method,
+                                    params.as_ref(),
+                                    policy,
+                                    installed,
+                                    &tx,
+                                );
+                                let mut reply = serde_json::Map::new();
+                                reply.insert("jsonrpc".into(), json!("2.0"));
+                                reply.insert("id".into(), id);
+                                for (k, v) in body {
+                                    reply.insert(k, v);
+                                }
+                                let line = format!("{}\n", Value::Object(reply));
+                                let mut out = stdin.lock();
+                                let _ = out.write_all(line.as_bytes());
+                                let _ = out.flush();
+                            });
                         } else if method == "session/update" {
                             match serde_json::from_value::<SessionNotification>(
                                 msg.get("params").cloned().unwrap_or(Value::Null),
@@ -225,6 +250,7 @@ impl AcpClient {
             events,
             agent_info: Mutex::new(None),
             permission_policy: policy,
+            handler,
         }))
     }
 
@@ -353,6 +379,14 @@ impl AcpClient {
         )
     }
 
+    /// Install a handler that decides permission requests.
+    ///
+    /// Without one the policy applies, which refuses. With one, the agent waits
+    /// for whatever the handler returns -- so it must eventually answer.
+    pub fn on_permission(&self, handler: PermissionHandler) {
+        *self.handler.lock() = Some(handler);
+    }
+
     pub fn shutdown(&self) {
         let mut child = self.child.lock();
         let _ = child.kill();
@@ -377,6 +411,7 @@ fn answer_request(
     method: &str,
     params: Option<&Value>,
     policy: PermissionPolicy,
+    handler: Option<PermissionHandler>,
     tx: &Sender<AgentEvent>,
 ) -> Vec<(String, Value)> {
     match method {
@@ -391,8 +426,28 @@ fn answer_request(
                 .and_then(|t| t.title.clone())
                 .unwrap_or_else(|| "an operation".to_string());
 
-            // Pick from the options the agent offered rather than inventing an
-            // id: option ids are agent-defined and a guess would be rejected.
+            // Ask the human when the editor has installed a handler. The id
+            // must come from the options the agent offered -- they are
+            // agent-defined, and an invented one would be rejected.
+            if let (Some(ask), Some(request)) = (handler, parsed.clone()) {
+                let answer = ask(request);
+                let _ = tx.send(AgentEvent::Log(match &answer {
+                    Some(id) => format!("permission: chose {id} for {what}"),
+                    None => format!("permission: no choice for {what}"),
+                }));
+                return match answer {
+                    Some(option_id) => vec![(
+                        "result".into(),
+                        json!({"outcome": {"outcome": "selected",
+                                           "optionId": option_id}}),
+                    )],
+                    None => vec![(
+                        "result".into(),
+                        json!({"outcome": {"outcome": "cancelled"}}),
+                    )],
+                };
+            }
+
             let wanted_allow = matches!(policy, PermissionPolicy::AllowOnce);
             let chosen = parsed.as_ref().and_then(|p| {
                 p.options

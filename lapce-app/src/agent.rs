@@ -35,7 +35,10 @@ use floem::{
         RwSignal, Scope, SignalGet, SignalUpdate, SignalWith, create_effect,
     },
 };
-use lapce_acp::{AcpClient, AgentEvent, SessionUpdate, StopReason, ToolCallStatus};
+use lapce_acp::{
+    AcpClient, AgentEvent, RequestPermissionParams, SessionUpdate, StopReason,
+    ToolCallStatus,
+};
 
 use crate::{
     command::{CommandExecuted, CommandKind},
@@ -101,6 +104,33 @@ pub struct ToolEntry {
     pub locations: Vec<(PathBuf, u32)>,
 }
 
+/// A permission request waiting for the user.
+///
+/// The agent is blocked until `answer` is sent, so every path out of the panel
+/// must send something -- including dismissal, which sends `None` and is
+/// reported to the agent as cancelled.
+#[derive(Clone)]
+pub struct PendingPermission {
+    pub title: String,
+    pub options: Vec<(String, String)>,
+    answer: crossbeam_channel::Sender<Option<String>>,
+}
+
+impl PendingPermission {
+    /// Answer with an option id, or `None` to cancel.
+    pub fn respond(&self, option_id: Option<String>) {
+        let _ = self.answer.send(option_id);
+    }
+}
+
+impl std::fmt::Debug for PendingPermission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingPermission")
+            .field("title", &self.title)
+            .finish_non_exhaustive()
+    }
+}
+
 /// What the connect thread hands back to the UI thread.
 type Connected = Result<(Arc<AcpClient>, String, String), String>;
 
@@ -112,6 +142,8 @@ pub struct AgentData {
     pub session_id: RwSignal<Option<String>>,
     pub agent_name: RwSignal<Option<String>>,
     client: RwSignal<Option<Arc<AcpClient>>>,
+    /// Set while the agent is waiting on a permission decision.
+    pub pending_permission: RwSignal<Option<PendingPermission>>,
     /// The prompt box. A local editor, the same mechanism the search panel uses,
     /// so it gets Lapce's own editing, keymaps and modal behaviour for free.
     pub input: EditorData,
@@ -171,6 +203,7 @@ impl AgentData {
             session_id: cx.create_rw_signal(None),
             agent_name: cx.create_rw_signal(None),
             client: cx.create_rw_signal(None),
+            pending_permission: cx.create_rw_signal(None),
             common,
         }
     }
@@ -253,6 +286,60 @@ impl AgentData {
             }
         });
 
+        // Permission requests reach the UI the same way agent events do: over
+        // a channel. The handler must be Send + Sync, so it cannot capture
+        // `AgentData` -- it captures a sender and nothing else.
+        let (perm_tx, perm_rx) = crossbeam_channel::unbounded::<PendingPermission>();
+        let (perm_ui_tx, perm_ui_rx) = mpsc::channel::<PendingPermission>();
+        std::thread::spawn(move || {
+            for pending in perm_rx {
+                if perm_ui_tx.send(pending).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let showing = self.clone();
+        let perm_signal = create_signal_from_channel(perm_ui_rx);
+        create_effect(move |_| {
+            if let Some(pending) = perm_signal.get() {
+                showing.pending_permission.set(Some(pending));
+            }
+        });
+
+        let ask = move |request: RequestPermissionParams| -> Option<String> {
+            let (answer_tx, answer_rx) =
+                crossbeam_channel::bounded::<Option<String>>(1);
+            let pending = PendingPermission {
+                title: request
+                    .tool_call
+                    .as_ref()
+                    .and_then(|t| t.title.clone())
+                    .unwrap_or_else(|| "an operation".to_string()),
+                options: request
+                    .options
+                    .iter()
+                    .map(|o| {
+                        (
+                            o.option_id.clone(),
+                            o.name.clone().unwrap_or_else(|| o.option_id.clone()),
+                        )
+                    })
+                    .collect(),
+                answer: answer_tx,
+            };
+
+            if perm_tx.send(pending).is_err() {
+                // Nobody is listening, so nothing can approve it. Refusing is
+                // the safe answer; the agent must not proceed unasked.
+                return None;
+            }
+            // Blocks until the panel responds. The agent is waiting too, which
+            // is the point: nothing proceeds without a decision.
+            answer_rx.recv().ok().flatten()
+        };
+        client.on_permission(std::sync::Arc::new(ask));
+
         self.client.set(Some(client));
         self.session_id.set(Some(session));
         self.agent_name.set(Some(name));
@@ -317,7 +404,15 @@ impl AgentData {
     }
 
     /// Interrupt the running turn.
+    ///
+    /// Also releases a pending permission request: the spec requires pending
+    /// requests to be answered on cancellation, and leaving one outstanding
+    /// would keep the agent blocked after the user asked it to stop.
     pub fn cancel(&self) {
+        if let Some(pending) = self.pending_permission.get_untracked() {
+            pending.respond(None);
+            self.pending_permission.set(None);
+        }
         if let (Some(client), Some(session)) =
             (self.client.get_untracked(), self.session_id.get_untracked())
         {

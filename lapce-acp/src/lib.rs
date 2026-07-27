@@ -40,9 +40,10 @@
 pub mod client;
 pub mod protocol;
 
-pub use client::{AcpClient, AgentEvent, RpcErr};
+pub use client::{AcpClient, AgentEvent, PermissionHandler, RpcErr};
 pub use protocol::{
-    ContentBlock, Implementation, InitializeResult, PlanEntry, SessionNotification,
+    ContentBlock, PermissionKind, PermissionOption, PermissionPolicy,
+    RequestPermissionParams, Implementation, InitializeResult, PlanEntry, SessionNotification,
     SessionUpdate, StopReason, ToolCall, ToolCallLocation, ToolCallStatus,
     ToolCallUpdate, ToolKind, PROTOCOL_VERSION,
 };
