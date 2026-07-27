@@ -179,20 +179,8 @@ impl AgentData {
         self.entries.update(|e| e.push_back(entry));
     }
 
-    /// Append streamed text to the trailing entry when it is the same kind,
-    /// otherwise start a new one.
     fn append_streamed(&self, text: &str, thought: bool) {
-        self.entries.update(|entries| {
-            match entries.back_mut() {
-                Some(Entry::Agent(s)) if !thought => s.push_str(text),
-                Some(Entry::Thought(s)) if thought => s.push_str(text),
-                _ => entries.push_back(if thought {
-                    Entry::Thought(text.to_string())
-                } else {
-                    Entry::Agent(text.to_string())
-                }),
-            }
-        });
+        self.entries.update(|entries| append_streamed(entries, text, thought));
     }
 
     /// Start an agent and open a session against `cwd`.
@@ -368,23 +356,7 @@ impl AgentData {
                     locations: to_locations(&c.locations),
                 })),
                 SessionUpdate::ToolCallUpdate(u) => {
-                    let locations = to_locations(&u.locations);
-                    self.entries.update(|entries| {
-                        let found = entries.iter_mut().rev().find(
-                            |e| matches!(e, Entry::Tool(t) if t.tool_id() == u.tool_call_id),
-                        );
-                        if let Some(Entry::Tool(t)) = found {
-                            if let Some(title) = u.title.clone() {
-                                t.title = title;
-                            }
-                            if u.status.is_some() {
-                                t.status = u.status;
-                            }
-                            if !locations.is_empty() {
-                                t.locations = locations;
-                            }
-                        }
-                    });
+                    self.entries.update(|entries| apply_tool_update(entries, &u));
                 }
                 // Plans and anything newer are not rendered specially yet, but
                 // must not be treated as an error.
@@ -406,12 +378,6 @@ impl AgentData {
     }
 }
 
-impl ToolEntry {
-    fn tool_id(&self) -> &str {
-        &self.id
-    }
-}
-
 fn to_locations(locations: &[lapce_acp::ToolCallLocation]) -> Vec<(PathBuf, u32)> {
     locations
         .iter()
@@ -420,4 +386,205 @@ fn to_locations(locations: &[lapce_acp::ToolCallLocation]) -> Vec<(PathBuf, u32)
             (PathBuf::from(&l.path), l.line.unwrap_or(1).saturating_sub(1))
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Transcript logic, kept as free functions over the entry list.
+//
+// These are the parts of the panel that can actually be wrong -- streaming
+// coalescence, tool-call merging, line-base conversion -- and holding them
+// outside `AgentData` means they can be tested without a reactive runtime or a
+// window. What remains in the view is layout and colour, which needs eyes
+// rather than assertions.
+// ---------------------------------------------------------------------------
+
+/// Append streamed text to the trailing entry when it is the same kind,
+/// otherwise start a new one. Without this, a streamed reply renders as one row
+/// per token.
+pub fn append_streamed(entries: &mut im::Vector<Entry>, text: &str, thought: bool) {
+    match entries.back_mut() {
+        Some(Entry::Agent(s)) if !thought => s.push_str(text),
+        Some(Entry::Thought(s)) if thought => s.push_str(text),
+        _ => entries.push_back(if thought {
+            Entry::Thought(text.to_string())
+        } else {
+            Entry::Agent(text.to_string())
+        }),
+    }
+}
+
+/// Merge a `tool_call_update` into its tool row.
+///
+/// Every field but the id is optional in ACP -- an update carries only what
+/// changed -- so an absent field must leave the existing value alone rather
+/// than blanking it.
+pub fn apply_tool_update(
+    entries: &mut im::Vector<Entry>,
+    update: &lapce_acp::ToolCallUpdate,
+) {
+    let locations = to_locations(&update.locations);
+    let found = entries
+        .iter_mut()
+        .rev()
+        .find(|e| matches!(e, Entry::Tool(t) if t.id == update.tool_call_id));
+    if let Some(Entry::Tool(t)) = found {
+        if let Some(title) = update.title.clone() {
+            t.title = title;
+        }
+        if update.status.is_some() {
+            t.status = update.status;
+        }
+        if !locations.is_empty() {
+            t.locations = locations;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use lapce_acp::{ToolCallLocation, ToolCallStatus, ToolCallUpdate};
+
+    use super::*;
+
+    fn tool(id: &str, title: &str) -> Entry {
+        Entry::Tool(ToolEntry {
+            id: id.into(),
+            title: title.into(),
+            status: Some(ToolCallStatus::Pending),
+            locations: vec![],
+        })
+    }
+
+    fn update(id: &str) -> ToolCallUpdate {
+        ToolCallUpdate {
+            tool_call_id: id.into(),
+            title: None,
+            status: None,
+            locations: vec![],
+            content: vec![],
+        }
+    }
+
+    #[test]
+    fn streamed_chunks_coalesce_into_one_row() {
+        let mut e = im::Vector::new();
+        for chunk in ["Hel", "lo ", "world"] {
+            append_streamed(&mut e, chunk, false);
+        }
+        assert_eq!(e.len(), 1, "a streamed reply must not be one row per token");
+        assert!(matches!(&e[0], Entry::Agent(s) if s == "Hello world"));
+    }
+
+    #[test]
+    fn thinking_never_merges_into_the_answer() {
+        // The bug this prevents: a model's scratchpad rendered as its reply.
+        let mut e = im::Vector::new();
+        append_streamed(&mut e, "let me think", true);
+        append_streamed(&mut e, "the answer", false);
+        append_streamed(&mut e, " continues", false);
+
+        assert_eq!(e.len(), 2);
+        assert!(matches!(&e[0], Entry::Thought(s) if s == "let me think"));
+        assert!(matches!(&e[1], Entry::Agent(s) if s == "the answer continues"));
+    }
+
+    #[test]
+    fn a_reply_after_a_tool_call_starts_a_new_row() {
+        let mut e = im::Vector::new();
+        append_streamed(&mut e, "first", false);
+        e.push_back(tool("c1", "searching"));
+        append_streamed(&mut e, "second", false);
+
+        assert_eq!(e.len(), 3);
+        assert!(matches!(&e[2], Entry::Agent(s) if s == "second"));
+    }
+
+    #[test]
+    fn a_tool_update_merges_into_its_own_row() {
+        let mut e = im::Vector::new();
+        e.push_back(tool("c1", "searching"));
+        e.push_back(tool("c2", "editing"));
+
+        let mut u = update("c1");
+        u.status = Some(ToolCallStatus::Completed);
+        u.title = Some("searched 3 files".into());
+        apply_tool_update(&mut e, &u);
+
+        match (&e[0], &e[1]) {
+            (Entry::Tool(a), Entry::Tool(b)) => {
+                assert_eq!(a.title, "searched 3 files");
+                assert_eq!(a.status, Some(ToolCallStatus::Completed));
+                assert_eq!(b.title, "editing", "the other row must be untouched");
+            }
+            _ => panic!("expected two tool rows"),
+        }
+    }
+
+    #[test]
+    fn absent_fields_in_an_update_do_not_blank_existing_values() {
+        // ACP updates carry only what changed. Treating a missing field as
+        // "clear it" wipes the title the moment a status-only update arrives.
+        let mut e = im::Vector::new();
+        e.push_back(tool("c1", "searching the repository"));
+        apply_tool_update(&mut e, &update("c1"));
+
+        match &e[0] {
+            Entry::Tool(t) => {
+                assert_eq!(t.title, "searching the repository");
+                assert_eq!(t.status, Some(ToolCallStatus::Pending));
+            }
+            _ => panic!("expected a tool row"),
+        }
+    }
+
+    #[test]
+    fn an_update_for_an_unknown_tool_is_ignored() {
+        let mut e = im::Vector::new();
+        e.push_back(tool("c1", "searching"));
+        let mut u = update("nope");
+        u.title = Some("hijacked".into());
+        apply_tool_update(&mut e, &u);
+
+        assert!(matches!(&e[0], Entry::Tool(t) if t.title == "searching"));
+    }
+
+    #[test]
+    fn acp_lines_are_converted_to_the_editors_zero_base() {
+        // ACP is 1-based, the editor is 0-based. Getting this wrong opens the
+        // file one line off -- easy to miss, maddening to use.
+        let locs = to_locations(&[
+            ToolCallLocation {
+                path: "/a/moe.py".into(),
+                line: Some(29),
+            },
+            ToolCallLocation {
+                path: "/a/x.py".into(),
+                line: Some(1),
+            },
+            ToolCallLocation {
+                path: "/a/y.py".into(),
+                line: None,
+            },
+        ]);
+        assert_eq!(locs[0].1, 28);
+        // Line 1 must not underflow to u32::MAX.
+        assert_eq!(locs[1].1, 0);
+        // A location with no line lands at the top of the file, not below it.
+        assert_eq!(locs[2].1, 0);
+    }
+
+    #[test]
+    fn status_reports_busy_only_while_work_is_in_flight() {
+        assert!(AgentStatus::Connecting.is_busy());
+        assert!(AgentStatus::Working.is_busy());
+        assert!(!AgentStatus::Ready.is_busy());
+        assert!(!AgentStatus::Stopped.is_busy());
+        assert!(!AgentStatus::Failed("x".into()).is_busy());
+    }
+
+    #[test]
+    fn a_failure_reason_reaches_the_user() {
+        let s = AgentStatus::Failed("connection refused".into()).describe();
+        assert!(s.contains("connection refused"), "silent failure: {s}");
+    }
 }
