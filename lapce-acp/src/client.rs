@@ -51,12 +51,14 @@ pub enum AgentEvent {
 /// A running agent subprocess.
 pub struct AcpClient {
     child: Mutex<Child>,
-    stdin: Mutex<ChildStdin>,
+    stdin: Arc<Mutex<ChildStdin>>,
     next_id: AtomicU64,
     pending: Arc<Mutex<HashMap<u64, Sender<Result<Value, RpcErr>>>>>,
     pub events: Receiver<AgentEvent>,
     /// Agent identity from `initialize`, once the handshake has run.
     pub agent_info: Mutex<Option<Implementation>>,
+    /// What to do when the agent asks permission. Refuses by default.
+    pub permission_policy: Arc<Mutex<PermissionPolicy>>,
 }
 
 #[derive(Debug, Clone)]
@@ -101,14 +103,23 @@ impl AcpClient {
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
         let stderr = child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?;
 
+        // Shared so the reader thread can *answer* agent->client requests. It
+        // has to: an unanswered request leaves the agent blocked forever, and
+        // from outside that is indistinguishable from a slow model.
+        let stdin = Arc::new(Mutex::new(stdin));
+        let policy = Arc::new(Mutex::new(PermissionPolicy::default()));
+
         let (tx, events) = unbounded();
         let pending: Arc<Mutex<HashMap<u64, Sender<Result<Value, RpcErr>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
-        // Reader: responses resolve waiters, notifications become events.
+        // Reader: responses resolve waiters, notifications become events,
+        // requests get answered.
         {
             let pending = pending.clone();
             let tx = tx.clone();
+            let stdin = stdin.clone();
+            let policy = policy.clone();
             thread::spawn(move || {
                 let mut reader = BufReader::new(stdout);
                 let mut line = String::new();
@@ -130,7 +141,41 @@ impl AcpClient {
                         }
                     };
 
-                    if let Some(id) = msg.get("id").and_then(|v| v.as_u64()) {
+                    // `method` first: a *request* carries both `method` and
+                    // `id`, so keying on `id` alone would mistake one for a
+                    // response and silently drop it -- hanging the agent.
+                    if let Some(method) = msg.get("method").and_then(|m| m.as_str())
+                    {
+                        if let Some(id) = msg.get("id").cloned() {
+                            let body = answer_request(
+                                method,
+                                msg.get("params"),
+                                *policy.lock(),
+                                &tx,
+                            );
+                            let mut reply = serde_json::Map::new();
+                            reply.insert("jsonrpc".into(), json!("2.0"));
+                            reply.insert("id".into(), id);
+                            for (k, v) in body {
+                                reply.insert(k, v);
+                            }
+                            let line = format!("{}\n", Value::Object(reply));
+                            let mut out = stdin.lock();
+                            let _ = out.write_all(line.as_bytes());
+                            let _ = out.flush();
+                        } else if method == "session/update" {
+                            match serde_json::from_value::<SessionNotification>(
+                                msg.get("params").cloned().unwrap_or(Value::Null),
+                            ) {
+                                Ok(n) => {
+                                    let _ = tx.send(AgentEvent::Update(n));
+                                }
+                                Err(e) => {
+                                    tracing::warn!("acp: bad session/update: {e}")
+                                }
+                            }
+                        }
+                    } else if let Some(id) = msg.get("id").and_then(|v| v.as_u64()) {
                         let waiter = pending.lock().remove(&id);
                         if let Some(w) = waiter {
                             let outcome = match msg.get("error") {
@@ -146,21 +191,7 @@ impl AcpClient {
                             };
                             let _ = w.send(outcome);
                         }
-                    } else if msg.get("method").and_then(|m| m.as_str())
-                        == Some("session/update")
-                    {
-                        match serde_json::from_value::<SessionNotification>(
-                            msg.get("params").cloned().unwrap_or(Value::Null),
-                        ) {
-                            Ok(n) => {
-                                let _ = tx.send(AgentEvent::Update(n));
-                            }
-                            Err(e) => tracing::warn!("acp: bad session/update: {e}"),
-                        }
                     }
-                    // Other agent->client requests (fs/*, permission) are not
-                    // answered yet; the matching capabilities are advertised
-                    // false, so a conforming agent will not send them.
                 }
 
                 // Stream closed: nothing will ever answer an outstanding call.
@@ -188,11 +219,12 @@ impl AcpClient {
 
         Ok(Arc::new(Self {
             child: Mutex::new(child),
-            stdin: Mutex::new(stdin),
+            stdin,
             next_id: AtomicU64::new(1),
             pending,
             events,
             agent_info: Mutex::new(None),
+            permission_policy: policy,
         }))
     }
 
@@ -333,5 +365,83 @@ impl Drop for AcpClient {
         let mut child = self.child.lock();
         let _ = child.kill();
         let _ = child.wait();
+    }
+}
+
+/// Build the body of a reply to an agent->client request.
+///
+/// Returns the `result` or `error` member as key/value pairs. Every branch
+/// answers something: a request left unanswered blocks the agent for as long as
+/// it is willing to wait, and no error ever surfaces.
+fn answer_request(
+    method: &str,
+    params: Option<&Value>,
+    policy: PermissionPolicy,
+    tx: &Sender<AgentEvent>,
+) -> Vec<(String, Value)> {
+    match method {
+        "session/request_permission" => {
+            let parsed: Option<RequestPermissionParams> = params
+                .cloned()
+                .and_then(|p| serde_json::from_value(p).ok());
+
+            let what = parsed
+                .as_ref()
+                .and_then(|p| p.tool_call.as_ref())
+                .and_then(|t| t.title.clone())
+                .unwrap_or_else(|| "an operation".to_string());
+
+            // Pick from the options the agent offered rather than inventing an
+            // id: option ids are agent-defined and a guess would be rejected.
+            let wanted_allow = matches!(policy, PermissionPolicy::AllowOnce);
+            let chosen = parsed.as_ref().and_then(|p| {
+                p.options
+                    .iter()
+                    .find(|o| {
+                        o.kind.map(|k| k.is_allow()).unwrap_or(false) == wanted_allow
+                    })
+                    .or_else(|| p.options.first())
+            });
+
+            match chosen {
+                Some(option) => {
+                    let granted =
+                        option.kind.map(|k| k.is_allow()).unwrap_or(false);
+                    let _ = tx.send(AgentEvent::Log(format!(
+                        "permission {} for {what}",
+                        if granted { "granted" } else { "refused" }
+                    )));
+                    vec![(
+                        "result".into(),
+                        json!({
+                            "outcome": {
+                                "outcome": "selected",
+                                "optionId": option.option_id,
+                            }
+                        }),
+                    )]
+                }
+                None => {
+                    // No options offered, so nothing can be selected. Cancelled
+                    // is the spec's answer for "no choice was made".
+                    let _ = tx.send(AgentEvent::Log(format!(
+                        "permission request for {what} had no options; cancelled"
+                    )));
+                    vec![(
+                        "result".into(),
+                        json!({ "outcome": { "outcome": "cancelled" } }),
+                    )]
+                }
+            }
+        }
+        // Capabilities for these are advertised false, so a conforming agent
+        // should not ask -- but answering with an error beats not answering.
+        _ => vec![(
+            "error".into(),
+            json!({
+                "code": -32601,
+                "message": format!("{method} is not supported by this client"),
+            }),
+        )],
     }
 }

@@ -382,3 +382,95 @@ mod tests {
         assert_eq!(v["prompt"][0]["text"], "hi");
     }
 }
+
+// ----------------------------------------------------------- permissions
+
+/// An agent asking before it does something consequential.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestPermissionParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub tool_call: Option<ToolCallUpdate>,
+    #[serde(default)]
+    pub options: Vec<PermissionOption>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionOption {
+    pub option_id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub kind: Option<PermissionKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionKind {
+    AllowOnce,
+    AllowAlways,
+    RejectOnce,
+    RejectAlways,
+    #[serde(other)]
+    Unknown,
+}
+
+impl PermissionKind {
+    pub fn is_allow(self) -> bool {
+        matches!(self, PermissionKind::AllowOnce | PermissionKind::AllowAlways)
+    }
+}
+
+/// What the client does when an agent asks for permission.
+///
+/// The default is to refuse. An editor that silently grants whatever it is
+/// asked is worse than one that cannot grant at all, because the user believes
+/// they are being consulted. Until the panel can actually ask, refusing and
+/// saying so is the honest behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PermissionPolicy {
+    #[default]
+    DenyAll,
+    /// Grant single-use permission automatically. For a trusted local agent.
+    AllowOnce,
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+
+    #[test]
+    fn parses_a_permission_request() {
+        let p: RequestPermissionParams = serde_json::from_str(
+            r#"{"sessionId":"s1","toolCall":{"toolCallId":"c1","title":"write file"},
+                "options":[
+                  {"optionId":"y","name":"Allow","kind":"allow_once"},
+                  {"optionId":"n","name":"Reject","kind":"reject_once"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(p.session_id, "s1");
+        assert_eq!(p.options.len(), 2);
+        assert_eq!(p.options[0].kind, Some(PermissionKind::AllowOnce));
+        assert!(p.options[0].kind.unwrap().is_allow());
+        assert!(!p.options[1].kind.unwrap().is_allow());
+    }
+
+    #[test]
+    fn an_unknown_option_kind_parses() {
+        let p: RequestPermissionParams = serde_json::from_str(
+            r#"{"sessionId":"s","options":[{"optionId":"x","kind":"maybe"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(p.options[0].kind, Some(PermissionKind::Unknown));
+        assert!(!p.options[0].kind.unwrap().is_allow());
+    }
+
+    #[test]
+    fn the_default_policy_refuses() {
+        // Silently granting is worse than not being able to grant: the user
+        // believes they are being consulted.
+        assert_eq!(PermissionPolicy::default(), PermissionPolicy::DenyAll);
+    }
+}
